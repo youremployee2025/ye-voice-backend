@@ -1,0 +1,17 @@
+{
+  "services": {
+    "ye-voice-backend": {
+      "root": ".",
+      "buildCommand": "npm ci && npx prisma generate && npm run build && npx prisma migrate deploy"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/(.*)",
+      "destination": {
+        "type": "service",
+        "service": "ye-voice-backend"
+      }
+    }
+  ]
+}

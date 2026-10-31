@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "Campaign" ADD COLUMN "maxDialsPerDay" INTEGER NOT NULL DEFAULT 2;

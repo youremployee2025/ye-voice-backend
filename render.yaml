@@ -1,0 +1,140 @@
+# Render blueprint for ye-voice-backend.
+#
+# ALWAYS-ON REQUIREMENT: this service runs the background workers in-process
+# when WORKERS_ENABLED=true (the default) — the DID renewal sweep, the outbound
+# dialer sweep, the schedule scanner, and the analytics ingest, all of them
+# BullMQ jobs now. A free instance sleeps when idle, and a sleeping dispatcher
+# places no calls, releases no numbers, and collects nobody's money. Production
+# must run on a paid, always-on plan.
+#
+# REDIS IS REQUIRED. Every piece of background work is scheduled over REDIS_URL,
+# and the webhook handler enqueues what it verifies, so a deployment without a
+# reachable Redis does no background work and cannot accept a delivery. Point it
+# at a managed Redis (Render Key Value, Upstash, or equivalent) with persistence
+# on — a flush loses webhook events that are in flight, which the reaper then
+# has to recover against the platform's own record.
+#
+# SPLITTING THE WORKERS OFF is a configuration change and not a code change: add
+# a second service with `startCommand: npm run start:worker` and the same
+# environment, and set WORKERS_ENABLED=false on this one. Both must reach the
+# same Postgres and the same Redis. It buys deploy isolation, not upstream
+# capacity — the call-start window, the concurrency pool and the supplier
+# balance belong to the one partner account, and instances share that ceiling.
+#
+# Every env var is declared sync: false — names only, values set in the
+# Render dashboard (or via API) per environment — so this file is identical
+# for every account it deploys to. PORT is injected by Render; NODE_ENV is
+# production by default. Neither is declared here.
+services:
+  - type: web
+    name: ye-voice-backend
+    runtime: node
+    plan: starter
+    buildCommand: npm ci && npx prisma generate && npm run build
+    # Runs in the deploy pipeline, before the new version starts serving.
+    # preDeployCommand requires a paid plan; on a free instance move this
+    # into startCommand: `npx prisma migrate deploy && npm run start`.
+    preDeployCommand: npx prisma migrate deploy
+    startCommand: npm run start
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: CLERK_SECRET_KEY
+        sync: false
+      - key: CLERK_PUBLISHABLE_KEY
+        sync: false
+      - key: CORS_ORIGIN
+        sync: false
+      # Required. The queues live here; see the note at the top of this file.
+      - key: REDIS_URL
+        sync: false
+      - key: VOCOBASE_API_KEY
+        sync: false
+      - key: VOCOBASE_API_URL
+        sync: false
+      # Required once the partner holds more than one active VoiceLink
+      # connection: upstream refuses to guess between them, and without it
+      # `/calls/start` answers CONNECTION_AMBIGUOUS and campaign start is
+      # refused. Optional on a single-connection account.
+      - key: VOCOBASE_VOICELINK_CONNECTION_ID
+        sync: false
+      # Default true. The DID sync provisions a number as it imports it.
+      - key: VOICELINK_AUTO_CALL_READY
+        sync: false
+      # Default 900000 (15 min). Refreshes the local agent mirror.
+      - key: AGENT_SYNC_INTERVAL_MS
+        sync: false
+      # Logging. All optional: unset means structured JSON on stdout and no
+      # shipping, which is a complete configuration rather than a degraded one.
+      - key: LOG_LEVEL
+        sync: false
+      - key: AXIOM_DATASET
+        sync: false
+      - key: AXIOM_TOKEN
+        sync: false
+      - key: AXIOM_EDGE
+        sync: false
+      - key: VOCOBASE_WEBHOOK_SECRET
+        sync: false
+      - key: VOCOBASE_WEBHOOK_SECRET_PREVIOUS
+        sync: false
+      - key: ADMIN_STAFF_TOKEN
+        sync: false
+      - key: RECORDING_TOKEN_SECRET
+        sync: false
+      # 1 behind Render's proxy — req.ip and the admin rate limiter key on it.
+      - key: TRUST_PROXY_HOPS
+        sync: false
+      - key: WORKERS_ENABLED
+        sync: false
+      - key: DIALER_ENABLED
+        sync: false
+      - key: DIALER_TEST_ALLOWLIST
+        sync: false
+      # How long a killed instance's claimed contacts sit before another
+      # instance frees them. Optional; defaults to five minutes.
+      - key: CAMPAIGN_CLEANUP_MS
+        sync: false
+      - key: DIALER_SWEEP_MS
+        sync: false
+      - key: DIALER_MAX_CALLS_PER_SWEEP
+        sync: false
+      - key: DIALER_DEFAULT_ACCOUNT_CONCURRENCY
+        sync: false
+      - key: DIALER_MIN_BALANCE_CREDITS
+        sync: false
+      - key: DIALER_ATTEMPT_TIMEOUT_MINS
+        sync: false
+      - key: DID_DEFAULT_MONTHLY_PRICE_CREDITS
+        sync: false
+      - key: DID_RENEWAL_SWEEP_MS
+        sync: false
+      - key: DID_GRACE_DAYS
+        sync: false
+      - key: DID_MAX_RELEASES_PER_SWEEP
+        sync: false
+      - key: SCHEDULE_SCAN_MS
+        sync: false
+      - key: ANALYTICS_SYNC_ENABLED
+        sync: false
+      - key: ANALYTICS_SYNC_INTERVAL_MS
+        sync: false
+      - key: ANALYTICS_SYNC_MAX_PAGES
+        sync: false
+      - key: ANALYTICS_SYNC_OVERLAP_MINS
+        sync: false
+      - key: ANALYTICS_REFRESH_RATE_LIMIT_MAX
+        sync: false
+      - key: CALL_LIST_RATE_LIMIT_MAX
+        sync: false
+      - key: CALL_DETAIL_RATE_LIMIT_MAX
+        sync: false
+      - key: CALL_RECORDING_RATE_LIMIT_MAX
+        sync: false
+      - key: ADMIN_RATE_LIMIT_MAX
+        sync: false
+      - key: ADMIN_AUTH_FAILURE_MAX
+        sync: false
+      - key: ADMIN_RATE_LIMIT_WINDOW_MS
+        sync: false

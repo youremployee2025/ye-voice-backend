@@ -1,0 +1,1932 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum WorkspaceRole {
+  ADMIN
+  MEMBER
+}
+
+enum InviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  REVOKED
+}
+
+model Account {
+  id               String   @id @default(cuid())
+  clerkUserId      String   @unique
+  email            String   @unique
+  name             String?
+  imageUrl         String?
+  credits          BigInt   @default(0)
+  /// Simultaneous calls this account may have in flight across every workspace
+  /// it owns — YE's slice of the capacity the voice platform sells it.
+  ///
+  /// Null means the platform default applies (`DIALER_DEFAULT_ACCOUNT_CONCURRENCY`),
+  /// exactly as a null `PhoneNumber.monthlyPriceCredits` means the default
+  /// catalog price. Null NEVER means unlimited.
+  ///
+  /// **Zero is a real value** and means this account may not dial at all. The
+  /// resolver reads this with `??` and never `||` — `||` would step over a
+  /// deliberate 0 straight onto the default and silently start dialing again
+  /// for an account staff had stopped. That is the identical trap
+  /// `tierPricing.ts` documents, and it is worse here because it is silent.
+  concurrencyLimit Int?
+  /// Staff flag. Set only through the staff-token admin API, never through a
+  /// Clerk-authenticated route. `requireMembership` treats a flagged account as
+  /// an ADMIN and owner in every live workspace it is not a member of.
+  isSuperAdmin     Boolean  @default(false)
+  createdAt        DateTime @default(now())
+
+  ownedWorkspaces    Workspace[]         @relation("WorkspaceOwner")
+  memberships        WorkspaceMember[]
+  sentInvites        WorkspaceInvite[]   @relation("InviteSender")
+  creditTransactions CreditTransaction[]
+  notificationReads  NotificationRead[]
+  tiers              AccountTier[]
+  superAdminActions  SuperAdminAction[] @relation("SuperAdminActor")
+  superAdminActionsAbout SuperAdminAction[] @relation("SuperAdminSubject")
+}
+
+model Workspace {
+  id              String    @id @default(cuid())
+  name            String
+  slug            String    @unique
+  color           String?
+  ownerAccountId  String
+  createdAt       DateTime  @default(now())
+  /// When a member last *attempted* a refresh of this workspace's agents.
+  /// Attempt, not success: a workspace holding one agent Vocobase no longer
+  /// serves must still be throttled, or its cooldown never engages again.
+  lastAgentSyncAt DateTime?
+  /// When the owner deleted this workspace. The row survives the delete on
+  /// purpose: `PhoneNumber.workspace` and `CreditTransaction.workspace` are
+  /// both `onDelete: Restrict`, and both comments say why — a workspace's
+  /// billing history must not evaporate exactly when somebody wants to read
+  /// it. Keeping the row is what keeps those constraints satisfied.
+  ///
+  /// Honoured by `requireMembership`, `/api/me` and the invite loader.
+  /// Deliberately NOT honoured by `uniqueSlug`: re-issuing a dead workspace's
+  /// slug would make old links resolve to a stranger's workspace.
+  deletedAt       DateTime?
+  /// The workspace's own customer on the voice platform, created on first use
+  /// by `lib/partnerCustomer.ts`. The platform's connections are partner-wide
+  /// — one account, every workspace's OAuth tokens in one pool — so a Google
+  /// connection minted through this customer is the only way a token row
+  /// upstream belongs to *this* workspace rather than to YE at large.
+  ///
+  /// Unique, and that is load-bearing rather than tidy: the upstream create is
+  /// idempotent on `external_id`, so two requests racing the first use both
+  /// come back holding the same customer id — and the constraint is what turns
+  /// the loser of that race into a re-read of the winner's row rather than a
+  /// second write.
+  partnerCustomerId String? @unique
+
+  owner              Account             @relation("WorkspaceOwner", fields: [ownerAccountId], references: [id])
+  members            WorkspaceMember[]
+  invites            WorkspaceInvite[]
+  agents             Agent[]
+  campaigns          Campaign[]
+  contacts           Contact[]
+  phoneNumbers       PhoneNumber[]
+  creditTransactions CreditTransaction[]
+  notifications      Notification[]
+  resources          WorkspaceResource[]
+  superAdminActions  SuperAdminAction[]
+
+  @@index([ownerAccountId])
+  @@index([deletedAt])
+}
+
+model WorkspaceMember {
+  id          String        @id @default(cuid())
+  workspaceId String
+  accountId   String
+  role        WorkspaceRole
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  account   Account   @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, accountId])
+  @@index([accountId])
+}
+
+model WorkspaceInvite {
+  id          String        @id @default(cuid())
+  workspaceId String
+  email       String
+  role        WorkspaceRole
+  status      InviteStatus  @default(PENDING)
+  invitedById String
+  createdAt   DateTime      @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy Account   @relation("InviteSender", fields: [invitedById], references: [id])
+
+  @@unique([workspaceId, email, status])
+  @@index([email, status])
+}
+
+enum CampaignStatus {
+  DRAFT
+  /// Retained for rows written before the schedule moved into a column.
+  /// Nothing writes it any more — a scheduled start lives in
+  /// `Campaign.scheduledStartAt`, so a process restart cannot lose it — but
+  /// `start` and `stop` still accept it as a from-state, and Postgres cannot
+  /// drop an enum member.
+  SCHEDULED
+  RUNNING
+  PAUSED
+  COMPLETED
+  STOPPED
+  /// The owner's balance stopped the dialing, not an operator. Distinct from
+  /// PAUSED so `resume` knows to re-run the balance estimate, and so the page
+  /// can say which of the two happened.
+  CREDIT_EXHAUSTED
+}
+
+/// Why a contact's clock is currently set — the authoritative answer to "what
+/// is this row waiting for", written by every re-arm path.
+///
+/// It exists because the counters could not answer it. `followUpCount` is a
+/// lifetime tally, so a plain retry of a contact that was once followed up
+/// still reads as a follow-up forever; and `nextEligibleAt == callbackAt` was
+/// widened to cover an engine-chosen resume, which made a dropped call
+/// indistinguishable from a promise a person actually made. Both questions are
+/// about the arming that is in force *now*, so they get a column that says so.
+enum ContactArmKind {
+  /// Never dialled, or waiting for nothing more specific than its turn.
+  FRESH
+  /// The retry ladder set the clock.
+  RETRY
+  /// A goal follow-up set the clock: a conversation happened and left the
+  /// goal unmet.
+  FOLLOW_UP
+  /// An `immediate` resume of a conversation that dropped mid-call. Engine
+  /// chosen, not asked for — which is what separates it from CALLBACK.
+  RESUME
+  /// A promise: a person on the phone named a time and this is it.
+  CALLBACK
+}
+
+enum CampaignContactStatus {
+  PENDING
+  QUEUED
+  CALLING
+  COMPLETED
+  FAILED
+  EXCLUDED
+  /// Swept out of the queue by the campaign rather than by a person: the
+  /// campaign was stopped, or its retry budget was lowered past what this
+  /// contact had already consumed. EXCLUDED keeps its narrower meaning —
+  /// an operator removed this contact.
+  SKIPPED
+}
+
+/// Whether a campaign places calls, receives them, or both. Decides what the
+/// campaign IS, so it is editable in DRAFT only. `INBOUND` refuses to dial;
+/// `OUTBOUND` is the historical behaviour and takes no new start gate.
+enum CampaignType {
+  OUTBOUND
+  INBOUND
+  BOTH
+}
+
+model Campaign {
+  id            String         @id @default(cuid())
+  workspaceId   String
+  name          String
+  /// What the campaign does with calls. `INBOUND`/`BOTH` require the campaign's
+  /// agent to have an inbound face and claim every DID attached to them while
+  /// RUNNING; `OUTBOUND` (the default) contends for nothing and dials as before.
+  type          CampaignType   @default(OUTBOUND)
+  /// The agent this campaign dials with. Nullable, and null is a real state:
+  /// a draft has not chosen one yet, and `ON DELETE SET NULL` returns a
+  /// campaign to it when the agent row is deleted.
+  ///
+  /// A set value does NOT prove the agent is still this workspace's. Staff
+  /// unassign by setting `Agent.workspaceId = null` — an UPDATE the constraint
+  /// cannot see — so every read that matters re-resolves against the workspace.
+  agentId       String?
+  /// The DID this campaign dials from. Nullable, and null is a real state: a
+  /// draft has not chosen one yet, and `ON DELETE SET NULL` returns a campaign
+  /// to it when the number row is deleted.
+  ///
+  /// A set value does NOT prove the number is still this workspace's to use. A
+  /// DID goes back to the shared pool through an UPDATE the constraint cannot
+  /// see, so every read that matters re-resolves it against the workspace and
+  /// its status rather than trusting the column.
+  phoneNumberId String?
+  status        CampaignStatus @default(DRAFT)
+
+  /// Operator's own note about what this campaign is for. Trimmed; empty means
+  /// null, so "set to nothing" and "never set" are one state.
+  description String? @db.Text
+
+  // Dialing window, in the campaign's own timezone.
+  fromTime String? // "HH:MM"
+  toTime   String? // "HH:MM"
+  timezone String? // IANA, e.g. "Asia/Kolkata"
+
+  /// Which weekdays this campaign may dial on, read in `timezone`.
+  /// 0 = Sunday … 6 = Saturday, matching `Date.getUTCDay()`.
+  ///
+  /// EMPTY MEANS EVERY DAY, and so does a full set of seven. That is what lets
+  /// the column arrive without changing a single existing campaign: every row
+  /// is created empty, and empty is the unrestricted state it was already in.
+  /// It also means "never dial" is deliberately inexpressible here — a
+  /// campaign that dials on no day is a paused campaign, and saying it twice
+  /// in two vocabularies is how the two come to disagree.
+  ///
+  /// Restricting days needs a `timezone`, because "which day is it" has no
+  /// answer without one. `evaluateWindow` calls a restricted set with no zone
+  /// incomplete and pauses the campaign, the same fail-closed reading it gives
+  /// hours with no zone.
+  dialDays Int[] @default([])
+
+  /// ISO-3166 alpha-2. Interprets uploaded numbers that carry no country code
+  /// of their own; null means such rows are rejected rather than guessed at.
+  defaultCountry String?
+
+  /// How many times a contact is dialed AFTER the first call. Not the number
+  /// of dials: 0 means one call and no more, and `CampaignContact.attempts`
+  /// counts against this rather than counting dials placed.
+  ///
+  /// A callback spends none of this. A promise made to a person on the phone
+  /// is not a retry, and budgeting it as one would let a lowered retry count
+  /// silently cancel a call somebody was told to expect.
+  retryCount Int @default(2)
+
+  /// The wait before a retry when `retryDelaysMinutes` has no entry for it.
+  /// At least 1 — a zero cooldown is the dispatcher re-dialing a number the
+  /// moment it hung up.
+  cooldownMinutes Int @default(120)
+
+  /// The retry ladder: element *i* is the wait before retry *i+1*, in minutes.
+  /// Shorter than `retryCount` on purpose is normal — the entries that run out
+  /// fall back to `cooldownMinutes`. 0 IS legal here and means "on the next
+  /// tick", which is a thing an operator may deliberately want for the first
+  /// retry after a busy signal and never wants as a blanket default.
+  retryDelaysMinutes Int[] @default([])
+
+  /// Most calls this campaign may have in flight at once.
+  ///
+  /// The customer's own fairness control: without it, one campaign holds every
+  /// line its account was allotted and a campaign started an hour later never
+  /// dials. It is the narrowest of four caps the sweep applies — see
+  /// `src/lib/concurrency.ts`.
+  concurrencyLimit Int @default(2)
+
+  /// Slots out of `concurrencyLimit` held for contacts that are on a retry.
+  ///
+  /// 0 is one shared FIFO pool and is the default. Above 0 the dispatcher runs
+  /// two lanes so a long tail of retries cannot starve the fresh list, or the
+  /// reverse — each may still borrow the other's idle slots, so the reservation
+  /// costs no throughput when only one lane has work.
+  retryConcurrency Int @default(0)
+
+  /// Of the slots that reach the non-fresh side, the percent held for plain
+  /// retries; the remainder is the urgent lanes, `CALLBACK` and `RESUME`.
+  ///
+  /// A floor and not a ceiling — whichever side runs dry, the other takes its
+  /// slots in the same pass — so this binds only while both have rows waiting.
+  /// `retryConcurrency` decides how many slots reach the split; this decides
+  /// how they are shared once they do, and it governs the borrowed slots too,
+  /// which is where a campaign whose import is finished spends everything.
+  ///
+  /// **0 is the default and reproduces the ordering that predates the split:**
+  /// retries get no floor and take whatever the urgent lanes leave, which is
+  /// exactly what the dispatcher did before. Setting it is opting in.
+  retrySharePercent Int @default(0)
+
+  /// Whether a person asking to be called back books one. Strict boolean at
+  /// every write path: the string "false" is truthy, and reading it as "on"
+  /// would have the campaign booking callbacks the caller forbade.
+  callbackEnabled Boolean @default(true)
+
+  /// CSV column → agent variable name, a flat object. Null means no mapping
+  /// and the legacy agent-declared projection applies, so this column is read
+  /// with `IS NULL` and must be SQL NULL rather than JSON `null`.
+  variableMap Json?
+
+  /// The extraction key this campaign sorts its leads by — one of the names its
+  /// agent declares. Null means the campaign does not bucket, which is a real
+  /// state and not the same as bucketing on nothing.
+  ///
+  /// Membership is computed at READ time out of `CallAttempt.extraction` and is
+  /// deliberately never stamped onto a contact. Choosing a key — or changing
+  /// it — then re-reads the campaign's own history, which is the point: an
+  /// operator does not know which answer matters until they have the answers,
+  /// and a campaign that finished last week is exactly the one worth sorting.
+  ///
+  /// Not a foreign key to anything. Extraction keys live in the agent's
+  /// upstream config, of which this service holds a cached snapshot; a
+  /// constraint here would be a constraint against a mirror.
+  leadBucketKey String?
+
+  /// Which of `leadBucketKey`'s values count as a won lead. Free text, because
+  /// a bucket is whatever a language model actually wrote in reply and an agent
+  /// pinning its answers is optional. Matched WITHOUT REGARD TO CASE at read
+  /// time, and refused case-insensitively on write, so `Hot` and `hot` are one
+  /// bucket in both directions.
+  ///
+  /// Meaningless without `leadBucketKey`, and the write path refuses the pair
+  /// that would be — a campaign reporting no won leads beside a settings card
+  /// still listing them is the failure that takes longest to notice.
+  wonBuckets String[] @default([])
+
+  /// Whether this campaign keeps calling a contact back until the
+  /// conversation is complete — the switch the four knobs below configure.
+  ///
+  /// A boolean and not the goal text, because the text stopped reaching the
+  /// model when the call-note contract landed: a dial carries one variable and
+  /// conformance G1 asserts the goal must not be among them. What the objective
+  /// IS lives in the agent's own prompt and is not YE's to state.
+  ///
+  /// DEPRECATED, and read by nothing since 2026-09-06. Follow-ups are always
+  /// on: every campaign chases an unfinished conversation until its dial
+  /// budget runs out, so there is no longer a state for this column to name.
+  /// Kept, defaulted `true` and backfilled `true`, so the data says what the
+  /// code does and an older dashboard build that still sends it cannot 400.
+  goalEnabled Boolean @default(true)
+
+  /// DEPRECATED, and read by nothing. The operator's own words from before
+  /// `goalEnabled` existed, kept one release so a campaign's stated intent is
+  /// not destroyed by the migration that stopped using it. Not sent to the
+  /// model, not returned by the API, not shown. Drop it once nobody has asked.
+  goal String?
+
+  /// DEPRECATED, and read by nothing since 2026-09-06. The hard ceiling on
+  /// dials of any kind for one contact is DERIVED now — `retryCount + 1`, the
+  /// first call plus the retries the operator already sets on the retry
+  /// panel — so the goal has no dial budget of its own to be tuned against
+  /// the one beside it. `totalDialsFor` in `lib/dialBudget.ts` is the rule.
+  /// Still accepted and still written, so an older dashboard cannot 400.
+  maxTotalDials Int @default(6)
+
+  /// How many more calls a contact may get once somebody has ANSWERED, spent
+  /// by every dial after the first conversation — answered or not — and
+  /// waited out at `followUpDelayHours`. Read again since 2026-09-09; 0 means
+  /// an unfinished conversation settles at once. The no-answer retries in
+  /// `retryCount` are a separate budget, forfeited the moment someone answers.
+  maxGoalFollowUps Int @default(2)
+
+  /// The wait before a follow-up, in hours, rolled into the dialing window.
+  /// Read again since 2026-09-09; the retry ladder times no-answers only.
+  followUpDelayHours Int @default(24)
+
+  /// The most placed dials one contact may get in one calendar day of the
+  /// campaign's timezone. Every arm counts except a CALLBACK the person asked
+  /// for. Enforced by the claim only: a contact at the cap waits for the next
+  /// local day and is never settled by it.
+  maxDialsPerDay Int @default(2)
+
+  /// DEPRECATED as a knob, and read by nothing since 2026-09-06: the gap
+  /// after a dropped conversation is the fixed `IMMEDIATE_CALLBACK_MINUTES`
+  /// (3) in `lib/campaignConfig.ts`. The default is moved to 3 for honesty;
+  /// the column is still accepted and still written.
+  ///
+  /// The lane it feeds is unchanged. A dropped call is the most time-sensitive
+  /// dial the engine places — the person is still there — so the re-arm stamps
+  /// `armKind = RESUME`, which takes a lane of its own ahead of retries and
+  /// fresh contacts.
+  ///
+  /// It does NOT arm `callbackAt`. An earlier draft did, to borrow the
+  /// callback lane, and that made an engine-chosen resume indistinguishable
+  /// from a time a person actually named — which the journey, the contacts
+  /// list and the retry-budget exemption all read as a promise. `RESUME` is
+  /// how the priority is expressed without saying anybody asked for it.
+  immediateCallbackMinutes Int @default(3)
+
+  /// When an operator stopped this campaign. Written once and never cleared —
+  /// `complete` relabels STOPPED to COMPLETED, and top-up and callback booking
+  /// key their refusal on this column rather than on the status precisely so
+  /// that relabel is not a two-click bypass of the refusal.
+  stoppedAt DateTime?
+
+  /// When a scheduled start should fire. Meaningful only while DRAFT; cleared
+  /// by start and by cancel-schedule.
+  ///
+  /// A column rather than an in-process timer: a restart loses a timer, and a
+  /// campaign that quietly never starts is indistinguishable from one nobody
+  /// scheduled.
+  scheduledStartAt DateTime?
+
+  /// Why the last scheduled start refused. A scheduled start never retries, so
+  /// this is the only record the operator gets of what went wrong overnight.
+  scheduleError String?
+
+  /// Round-robin cursor over the attached numbers. Only its modulo matters, so
+  /// it is never reset and is allowed to grow.
+  rrCursor Int @default(0)
+
+  // Counters, maintained inside the same transaction as the status change each
+  // one describes. Stats reads these rather than counting rows: a campaign of
+  // 100,000 contacts is one row read instead of four aggregates.
+  totalContacts  Int @default(0)
+  completedCount Int @default(0)
+  failedCount    Int @default(0)
+  skippedCount   Int @default(0)
+
+  startedAt   DateTime?
+  pausedAt    DateTime?
+  /// Why this campaign is not dialing, as a sentence a customer reads on the
+  /// campaign page. Written by every writer of PAUSED, CREDIT_EXHAUSTED and
+  /// STOPPED — the dialer's pauses carry the same body their notification
+  /// does, a person's pause or stop names who did it, a top-up's re-open says
+  /// so — and cleared by every transition out of a halt: start, resume, the
+  /// callback re-open and both completions. The notification is the history;
+  /// this is the current answer.
+  haltReason  String?
+  completedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace    Workspace             @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  agent        Agent?                @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  // SetNull for the same reason the agent uses it: a PhoneNumber is the
+  // platform's record and a campaign is the customer's, so a campaign must not
+  // be able to pin a DID row in place.
+  phoneNumber  PhoneNumber?          @relation(fields: [phoneNumberId], references: [id], onDelete: SetNull)
+  dialNumbers  CampaignPhoneNumber[]
+  contacts     CampaignContact[]
+  callAttempts CallAttempt[]
+  doNotCall    DoNotCall[]
+  // The DIDs this campaign is currently claiming for inbound (only while
+  // RUNNING and INBOUND/BOTH). Cascade-deleted with the campaign.
+  inboundClaims CampaignInboundClaim[]
+
+  @@index([workspaceId])
+  @@index([agentId])
+  @@index([phoneNumberId])
+  // The schedule scanner's only query: DRAFT rows whose start time has passed.
+  @@index([status, scheduledStartAt])
+}
+
+/// One number in a campaign's dialing rotation, at one position.
+///
+/// The rotation exists because a single DID placing every call on a list gets
+/// flagged by carriers long before the list runs out. Attach order IS rotation
+/// order — the operator's list is the answer, and inventing a second ordering
+/// would make the UI's list a lie.
+///
+/// `Campaign.phoneNumberId` survives as the legacy pointer at position 0, kept
+/// in sync by every write path, so readers that predate this table keep working.
+model CampaignPhoneNumber {
+  id            String   @id @default(cuid())
+  campaignId    String
+  phoneNumberId String
+  /// 0-based. The unique below makes a gap or a duplicate a write failure
+  /// rather than a rotation that silently skips a number.
+  position      Int
+  createdAt     DateTime @default(now())
+
+  campaign    Campaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  // Restrict, matching `PhoneNumber.workspace`: a DID a campaign is dialing
+  // from must not be deleted out from under it. Releasing a number back to the
+  // pool is a status change, which the rotation loader already filters on.
+  phoneNumber PhoneNumber @relation(fields: [phoneNumberId], references: [id], onDelete: Restrict)
+
+  @@unique([campaignId, phoneNumberId])
+  @@unique([campaignId, position])
+  @@index([phoneNumberId])
+}
+
+model Contact {
+  id          String   @id @default(cuid())
+  workspaceId String
+  phone       String // E.164
+  name        String?
+  email       String?
+  /// Free-form labels the operator segments on. An array rather than a join
+  /// table: they are the customer's own words, never referenced by id, and a
+  /// tag with no contacts on it is not a thing anybody wants to keep.
+  tags        String[] @default([])
+  /// Every CSV column that is not phone/name/email/tags, verbatim.
+  metadata    Json     @default("{}")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace        Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  campaignContacts CampaignContact[]
+
+  // Per workspace, NOT global: two workspaces may each hold the same phone.
+  @@unique([workspaceId, phone])
+  @@index([workspaceId])
+}
+
+model CampaignContact {
+  id            String                @id @default(cuid())
+  campaignId    String
+  contactId     String
+  status        CampaignContactStatus @default(PENDING)
+  /// RETRIES CONSUMED, not dials made. The first dial does not increment it and
+  /// neither does a callback; only the retry re-arm at resolution time does. It
+  /// is compared against `Campaign.retryCount`, which counts the same thing.
+  attempts      Int                   @default(0)
+  lastAttemptAt DateTime?
+
+  /// The instant the dispatcher claimed this contact (`PENDING -> QUEUED`).
+  /// The claim's durable record: between the claim and the placement worker's
+  /// attempt-row insert, this column is the only thing that says Redis owes a
+  /// dial for this contact. `releaseStaleClaims` reaps a `QUEUED` row whose
+  /// lease has expired with no attempt started since it — the
+  /// claimed-but-never-placed state a lost placement job leaves behind.
+  claimedAt DateTime?
+
+  /// The earliest instant this contact may be claimed. Stored rather than
+  /// computed from `lastAttemptAt + cooldownMinutes`, because a promised
+  /// callback is a specific instant that no formula over the campaign's
+  /// settings can reproduce.
+  nextEligibleAt DateTime?
+
+  /// The instant a person on the phone was told they would be called back,
+  /// kept after that call completes as history.
+  ///
+  /// **Written only by a real promise.** Whether a contact is *currently* owed
+  /// one is `armKind = CALLBACK` and nothing else. This column was once half
+  /// of that answer — `nextEligibleAt == callbackAt` was read as the armed
+  /// pair — and the pair could not tell a time a person named from a gap the
+  /// engine chose. Widening it to cover an immediate resume made a dropped
+  /// call read as a promise on the journey, in the contacts list, in the
+  /// callback count and in the retry-budget exemption, all at once. The
+  /// arming moved to its own column so this one could go back to meaning the
+  /// single thing it is named for.
+  callbackAt DateTime?
+
+  /// Why this contact's clock is set — see `ContactArmKind`. The single field
+  /// the claim's lanes, the queue tabs, the journey and the contacts list all
+  /// read, so the order a batch is chosen in and the label it later carries
+  /// cannot disagree.
+  ///
+  /// A settled row keeps whatever it last carried: every reader pairs this with
+  /// `status = PENDING`, so the value is only meaningful while the row waits.
+  armKind ContactArmKind @default(FRESH)
+
+  /// How many callbacks this contact has already been given. Bounded, because
+  /// a chain of "call me back tomorrow" has no natural end.
+  callbackCount Int @default(0)
+
+  /// Goal follow-ups consumed — the third counter beside `attempts` (retries)
+  /// and `callbackCount`, incremented only by the follow-up re-arm. History
+  /// on the row and nothing more since 2026-09-06: follow-ups have no budget
+  /// of their own, so nothing compares this against anything. The journey
+  /// renders it, and the claim reads it to tell a retry from a follow-up.
+  followUpCount Int @default(0)
+
+  /// When this contact was last re-armed as a RESUME — the moment the call
+  /// note said `immediate`, not the moment the resume dialled. Read by the
+  /// next immediate re-arm alone: one inside `IMMEDIATE_REPEAT_WINDOW_MINUTES`
+  /// of it is armed a whole window out instead of at `IMMEDIATE_CALLBACK_MINUTES`,
+  /// so a line that keeps dropping is rung once an hour rather than every gap.
+  /// Null until the first resume; never cleared, because a settled row keeps
+  /// its history and a resume outside the window reads it as no throttle.
+  lastImmediateAt DateTime?
+
+  /// Whether the campaign's goal was met for this contact. Null is a real
+  /// state and two of them: the campaign has no goal, or the contact has not
+  /// settled yet. Written only at settle time, beside the status change.
+  goalAchieved Boolean?
+
+  /// The most recently completed attempt's session id. Not a foreign key: a
+  /// re-arm frees the live attempt pointer and this must survive it.
+  lastSessionId String?
+
+  /// The last attempt's outcome, normalised to lowercase and COPIED here
+  /// rather than joined — the same re-arm that frees the attempt pointer would
+  /// otherwise take the outcome with it.
+  disposition String?
+  answeredBy  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaign     Campaign             @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contact      Contact              @relation(fields: [contactId], references: [id])
+  callAttempts CallAttempt[]
+  goal         CampaignContactGoal?
+
+  @@unique([campaignId, contactId])
+  @@index([contactId])
+  @@index([campaignId, status])
+  // The claim's own predicate: this campaign's PENDING rows that are due.
+  @@index([campaignId, status, nextEligibleAt])
+  // The callback queue views, which read across statuses.
+  @@index([campaignId, callbackAt])
+  /// The lanes claim on (campaign, status, armKind), then order within the lane.
+  @@index([campaignId, status, armKind], map: "campaign_contacts_arm_lane_idx")
+  /// The leads export pages a campaign's contacts by `(createdAt, id)`; without
+  /// this every page sorts the whole list, and a 50k-lead export is quadratic.
+  @@index([campaignId, createdAt, id], map: "campaign_contacts_export_keyset_idx")
+}
+
+/// One row per DID held by a RUNNING inbound-enabled campaign.
+///
+/// `phoneNumberId` is the primary key, and that IS the invariant: at most one
+/// live inbound-facing campaign may claim any DID. Two starts in the same
+/// second both read "no rival" and both proceed — a rule without a constraint
+/// behind it is a check-then-act — so the second insert fails on the key rather
+/// than on our reading of the world, exactly as a double DID rental is made
+/// unreachable rather than merely unlikely. Expressible as a key only because
+/// the rule admits no legal sharing.
+///
+/// `agentId` is the derived agent (whichever the claiming campaign dials with)
+/// and is a plain column, not a relation — the claim binds a DID to a campaign,
+/// and the agent is a fact recorded for the routing writes, not an edge to join.
+model CampaignInboundClaim {
+  phoneNumberId String   @id
+  campaignId    String
+  agentId       String
+  claimedAt     DateTime @default(now())
+
+  phoneNumber PhoneNumber @relation(fields: [phoneNumberId], references: [id], onDelete: Cascade)
+  campaign    Campaign    @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@index([campaignId])
+}
+
+/// An inbound call attributed to a campaign, written by the routing-policy
+/// handler before the session exists and settled by `session.completed`.
+///
+/// Deliberately NOT a `CallAttempt`. That table's invariant — an attempt exists
+/// only for a call the dialer placed — is load-bearing in three places:
+/// `callTimeline` reports `timelineSource: none` when there are none,
+/// `CampaignContact.attempts` counts retries consumed, and `attemptNo` is the
+/// dial mutual-exclusion token. Writing inbound calls there would corrupt all
+/// three, so they get their own stream and the journey merges the two by time.
+///
+/// `campaignContactId` and `contactId` are both nullable: an unknown caller is
+/// logged, not enrolled, and the campaign is still attributed through the DID
+/// claim.
+model CampaignInboundCall {
+  id                String    @id @default(uuid())
+  campaignId        String
+  campaignContactId String?
+  contactId         String?
+  workspaceId       String
+  phoneNumberId     String
+  fromNumber        String
+  /// The id the ROUTING POLICY carried: the carrier's `provider_call_id`. It is
+  /// the only id that event has, and it is NOT the id `GET /calls/:id` accepts.
+  upstreamCallId    String?   @unique
+  /// Vocobase's own `call.call_id` (its `PhoneCall.id`), learned at completion —
+  /// the policy callback never carries it. Two jobs: it is the id the calls
+  /// surface resolves, and it is what makes a redelivered completion settle the
+  /// row it already settled instead of fabricating a second one.
+  upstreamPhoneCallId String? @unique
+  upstreamSessionId String?   @unique
+  arrivedAt         DateTime  @default(now())
+  endedAt           DateTime?
+  durationSecs      Int?
+  disposition       String?
+  extraction        Json?
+  costCredits       BigInt?
+  /// The conversation, bounded by `sessionCapture` exactly as `CallAttempt`'s
+  /// is, and written by the same two hands: the completion webhook and the
+  /// session backfill. Null is no conversation recorded; `[]` is a call on
+  /// which nobody spoke.
+  transcript          Json?
+  /// Whether the platform holds audio — the FLAG, never the URL, for the
+  /// reason `CallAttempt.recordingAvailable` keeps only the flag. Null means
+  /// nothing has looked yet, which is what the backfill keys on.
+  recordingAvailable  Boolean?
+
+  @@index([campaignId, arrivedAt])
+  @@index([campaignContactId])
+}
+
+/// The goal context record: everything one campaign-contact carries between
+/// calls. One row per campaign-contact, created lazily by the first recorded
+/// attempt of a goal campaign — a campaign with no goal never writes one, so
+/// the absence of a row is itself the "no goal here" answer.
+///
+/// The record is no longer a merge of what the calls extracted. It is three
+/// things: `memory`, the paragraph the BOT rewrites at the end of every
+/// conversation and the only thing carried into the next call about the
+/// person; `lastCallNote`, a line YE derives itself from the attempt YE just
+/// recorded, so an unanswered dial still leaves a note where the bot wrote
+/// nothing; and `goalMissing`, the bot's last word on what the goal still
+/// needs. Prose rather than key/value, because the goal itself is now prose
+/// and there is no key list left to merge against.
+///
+/// The idempotency story, now in two halves, because two different things
+/// arrive out of order. `attemptLog` is keyed by `attemptNo` — a replayed
+/// attempt replaces its own entry and changes nothing else. `memory` cannot
+/// key itself that way, being one field rather than a list, so it carries
+/// `memoryAttempt`: a redelivery of attempt N landing after attempt N+1 has
+/// already written sees N < N+1 and declines, which stops a stale paragraph
+/// from overwriting a fresher one.
+model CampaignContactGoal {
+  id                String @id @default(uuid())
+  campaignContactId String @unique
+
+  /// The rolling memory: the paragraph the bot rewrites after every
+  /// conversation, and the one thing the next call is told about the person
+  /// beyond the note below. Null until a conversation has happened.
+  memory        String?
+  /// Which attempt wrote `memory`. A redelivery of attempt N landing after
+  /// attempt N+1 already wrote must not put N's paragraph back over N+1's.
+  memoryAttempt Int?
+  /// Derived by YE on every recorded attempt, silences included — never a
+  /// model's answer, so a voicemail always has a note.
+  lastCallNote  String  @default("")
+  /// The bot's last non-empty "still needed" line.
+  goalMissing   String?
+
+  /// One entry per recorded attempt: `{ attemptNo, kind, disposition,
+  /// answeredBy, nextAction?, reason?, callbackNote?, durationSecs? }`,
+  /// sorted by `attemptNo`. Keyed by `attemptNo` too, so replaying an attempt
+  /// replaces its own entry rather than appending a second one — but the sort
+  /// is the part callers depend on: the journey renders this array in order
+  /// and does not re-sort it, and a Json array has no key order of its own to
+  /// fall back on. Every writer must therefore put a replaced or appended
+  /// entry back in `attemptNo` order.
+  /// Bounded by `retryCount + 1 <= 21` (`MAX_RETRY_COUNT`), so a Json log
+  /// is safe: one entry of a few hundred bytes per dial.
+  attemptLog Json @default("[]")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Cascade like the campaign→contact relation above it: the record is queue
+  // context, not billing history, and has no meaning without its contact.
+  campaignContact CampaignContact @relation(fields: [campaignContactId], references: [id], onDelete: Cascade)
+}
+
+/// A campaign's do-not-call list. Per CAMPAIGN, deliberately: a person who
+/// says "stop calling me about this" has opted out of this campaign, and a
+/// second campaign in the workspace may still dial the number. Keyed by phone
+/// rather than by contact so it survives contact deletion and re-import
+/// within the campaign.
+model DoNotCall {
+  id                      String  @id @default(uuid())
+  campaignId              String
+  phone                   String // E.164
+  /// Why the number is listed, for the journey and the operator.
+  reason                  String?
+  /// The campaign contact whose call put the number here. A plain pointer,
+  /// not a foreign key: the opt-out must outlive the contact row it came from.
+  sourceCampaignContactId String?
+
+  createdAt DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, phone])
+}
+
+/// How many personas an agent is edited as. See `Agent.direction`.
+enum AgentDirection {
+  UNI
+  BI
+}
+
+/// Which of an agent's two upstream configurations a snapshot holds: the base
+/// (OUTBOUND) or the inbound face (INBOUND).
+enum PersonaSide {
+  OUTBOUND
+  INBOUND
+}
+
+/// What was about to overwrite the side a snapshot holds.
+enum PersonaSnapshotReason {
+  DIRECTION_UNI_KEEP_OUTBOUND
+  DIRECTION_UNI_KEEP_INBOUND
+  DIRECTION_BI_REVIVE
+  INBOUND_START_REVIVE
+  RESTORE
+}
+
+/// One side of an agent's persona, saved immediately before something wrote
+/// over it. An overwrite that cannot save one first does not happen.
+///
+/// `config` is the editable projection (`personaConfig`), untruncated; `hooks`
+/// is the list of hook write bodies (`hookRowToFaceCopy`), so a restore can
+/// replay them. The newest 20 per agent and side are kept.
+///
+/// `workspaceId` is the agent's workspace when the snapshot was taken, with no
+/// foreign key: it is an observation, and it is what keeps one tenant's
+/// snapshots from following a lent agent into the next tenant's workspace.
+/// Cascades with the agent, which only staff hard-delete.
+model AgentPersonaSnapshot {
+  id            String                @id @default(cuid())
+  agentId       String
+  workspaceId   String?
+  side          PersonaSide
+  reason        PersonaSnapshotReason
+  config        Json
+  hooks         Json
+  takenByUserId String?
+  createdAt     DateTime              @default(now())
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  // Leads with the foreign key, so it is also the FK index.
+  @@index([agentId, createdAt])
+  @@index([agentId, side, createdAt])
+}
+
+/// Local mirror of an agent configured in the voice platform. Rows are keyed
+/// by the platform's own agent id and refreshed by sync; `workspaceId` maps a
+/// row to at most one workspace and is owned by staff, never by sync.
+model Agent {
+  id            String    @id @default(cuid())
+  externalId    String    @unique
+  workspaceId   String?
+  name          String
+  status        String?
+  agentType     String?
+  /// Whether this agent has a second, inbound configuration upstream. Mirrored
+  /// by sync from the agent payload's `inbound.enabled` on every read, so it
+  /// follows the mirror rule: sync owns configuration, staff own assignment.
+  ///
+  /// **A campaign start DOES enable it**, since 2026-09-21 — that is the one
+  /// place the backend creates a face on an agent's behalf, and it writes
+  /// this column at once rather than waiting for the sweep. See
+  /// `src/lib/ensureInboundFace.ts`.
+  inboundEnabled Boolean  @default(false)
+  /// How many personas this agent is edited as.
+  ///
+  /// YE's own column, not a mirror: the platform has no equivalent — its
+  /// `agentType` is a two-value label that cannot express two personas and
+  /// controls nothing — so sync must never write this. `inboundEnabled` is
+  /// the platform's fact about whether a face exists; this is ours about
+  /// whether the two configurations are edited as one persona or two.
+  ///
+  /// UNI: one persona. Whatever the agent does — dial out or answer — it uses
+  /// this configuration, and once a face exists every save writes both sides.
+  /// The face itself is created lazily, the first time something routes
+  /// inbound to the agent, so an agent never used inbound never pays for one.
+  ///
+  /// BI: two personas. The face is created when the mode is chosen and the
+  /// two sides are saved independently from then on; nothing is mirrored.
+  direction     AgentDirection @default(UNI)
+  voiceId       String?
+  /// Resolved from the voice catalogue at sync time, so the UI need not.
+  voiceName     String?
+  /// The tier this agent's voice is sold in, resolved from the same catalogue
+  /// response that resolves `voiceName` — so it costs no extra request.
+  ///
+  /// Written by SYNC, which is consistent with the mirror invariant every
+  /// other table here holds: a tier's slug is a platform fact, while a tier's
+  /// price is YE's and lives on `Tier`. Without this column, pricing a call
+  /// would mean an upstream read per dial against a rate limit every customer
+  /// on the platform shares.
+  voiceTierSlug String?
+  language      String?
+  documentCount Int?
+  /// Pre-call variable names referenced by the prompt — a string array.
+  variables     Json      @default("[]")
+  /// Last full configuration snapshot; a display cache, not a source of truth.
+  rawConfig     Json?
+  lastSyncedAt  DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  // An agent outlives any workspace here, so deleting a workspace returns it
+  // to the unassigned pool rather than destroying the mirror.
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  campaigns Campaign[]
+  personaSnapshots AgentPersonaSnapshot[]
+
+  @@index([workspaceId])
+}
+
+enum WorkspaceResourceKind {
+  DOCUMENT
+  DICTIONARY
+  FUNCTION
+  CONNECTION
+}
+
+/// Maps a resource that lives in the voice platform's shared partner namespace
+/// to at most one workspace — the same rule `Agent.workspaceId` applies to
+/// agents, for the pools that have no column of their own.
+///
+/// Upstream, a dictionary, document, function or tool connection belongs to the
+/// partner account, not to an agent: listing them returns every workspace's.
+/// A row here is what makes one visible to exactly one workspace. A resource
+/// with no row is invisible to all of them, exactly as an unassigned agent is.
+///
+/// Deliberately not a mirror. It holds an id and a label, never content —
+/// terms, document text and function schemas stay upstream and are fetched
+/// live, so there is no second copy of customer data to keep correct.
+model WorkspaceResource {
+  id          String                @id @default(cuid())
+  kind        WorkspaceResourceKind
+  /// The resource's id in the voice platform.
+  externalId  String
+  workspaceId String
+  /// Last known upstream label. For staff listings, and for naming a resource
+  /// in an error raised by the very call that would have fetched its name.
+  name        String?
+  createdAt   DateTime              @default(now())
+  updatedAt   DateTime              @updatedAt
+
+  // Cascade, unlike Agent's SetNull. An agent is lent to a workspace by staff
+  // and outlives it, so it returns to the pool. A dictionary or function a
+  // workspace created has no meaning once that workspace is gone, and an
+  // orphan mapping row would make the staff pool listing lie. The upstream
+  // resource itself survives — this drops our mapping, not the platform's row.
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  // The invariant, enforced by the database rather than by care: a resource
+  // cannot be mapped to two workspaces, so no query has to defend against a
+  // second row.
+  @@unique([kind, externalId])
+  @@index([workspaceId, kind])
+}
+
+enum NotificationScope {
+  ALL_MEMBERS
+  ADMINS_ONLY
+}
+
+/// Something that already happened inside a workspace. One row per event, not
+/// one per recipient: who may see it is a function of *current* membership,
+/// evaluated at read time, so somebody joining, leaving or changing role never
+/// has to rewrite history.
+model Notification {
+  id          String            @id @default(cuid())
+  workspaceId String
+  /// Who may see this row. Enforced in the `where` clause of every query and
+  /// never filtered in the browser, where the data has already been sent.
+  scope       NotificationScope
+  /// Open-ended by design. New event types land with the module that emits
+  /// them, and a Postgres enum would make each one a migration in lockstep
+  /// with code on another branch. Nothing here branches on the value — it is
+  /// an opaque tag, so an unrecognised one degrades to "a notification".
+  type        String
+  /// Resolved when the event happened, not when it is read. A campaign
+  /// renamed afterwards must not retroactively rewrite the sentence that
+  /// announced it, and a deleted one must still render.
+  title       String
+  body        String
+  /// In-app path such as `/campaigns/abc`, fed to the router. Never an
+  /// absolute URL: a stored URL is an open redirect waiting for the first
+  /// emitter that builds one out of user input.
+  href        String?
+  createdAt   DateTime          @default(now())
+
+  workspace Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  reads     NotificationRead[]
+
+  // Every read is "this workspace, these scopes, newest first".
+  @@index([workspaceId, scope, createdAt])
+}
+
+/// One person having read one notification. The row's existence *is* the read
+/// state, so a new member needs no backfill — having read nothing is an empty
+/// set, which an absent row already says.
+model NotificationRead {
+  id             String   @id @default(cuid())
+  notificationId String
+  accountId      String
+  readAt         DateTime @default(now())
+
+  notification Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  account      Account      @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  // Marking read is idempotent at the database rather than in a handler.
+  @@unique([notificationId, accountId])
+  @@index([accountId])
+}
+
+enum PhoneNumberStatus {
+  UNASSIGNED
+  ASSIGNED
+  /// Held by a workspace whose renewal charge was declined. The DID still
+  /// belongs to them and still rings; the sweep retries every pass until the
+  /// grace window runs out.
+  PAST_DUE
+  RELEASED_NONPAYMENT
+}
+
+/// Why an account's balance is what it is.
+///
+/// Every value is in internal credit units (10000x the display value) and
+/// signed: negative is a charge, positive a grant. The full type set is
+/// declared up front so the slices that write the machine-generated kinds add
+/// rows rather than rename an enum in place.
+enum CreditTransactionType {
+  DID_PURCHASE
+  DID_RENEWAL
+  /// Zero-amount marker: the workspace gave the number back.
+  DID_RELEASE
+  /// Zero-amount marker: a renewal charge failed and the number was taken back.
+  DID_RELEASE_NONPAYMENT
+  /// A staff credit correction, written by the staff adjustment route.
+  ADJUSTMENT
+  /// Minutes consumed by one outbound call, charged when its completion
+  /// webhook arrives. Carries `callAttemptId`.
+  CALL_USAGE
+  /// Zero-amount marker: a call completed but the balance could not cover it.
+  /// Nothing was debited; `CallAttempt.costCredits` records what was owed and
+  /// the campaign was paused. A separate type rather than a zero `CALL_USAGE`
+  /// because "they paid for this call" and "they could not" are different
+  /// facts, and only one of them is a charge.
+  CALL_USAGE_SHORTFALL
+  /// Minutes consumed by one browser test session, charged when its completion
+  /// event arrives. Carries `testSessionId`.
+  ///
+  /// Deliberately NOT `CALL_USAGE`. That type's contract is that it carries a
+  /// `callAttemptId`, and `LEDGER_CALL` in `serialize.ts` is the include that
+  /// reads it — a usage row with a null attempt would render on the billing
+  /// surface as a charge for a call that does not exist, which is worse than
+  /// an unfamiliar word.
+  TEST_SESSION_USAGE
+  /// Zero-amount marker: a test session ran and the balance could not cover
+  /// it. Nothing was debited; `TestSession.costCredits` records what was owed.
+  TEST_SESSION_SHORTFALL
+  /// The opening balance staff give a customer when they are onboarded,
+  /// written by the onboarding endpoint and by nothing else.
+  ///
+  /// Deliberately not `ADJUSTMENT`. That type means staff corrected a balance
+  /// that was already wrong; this one means a balance was started. The
+  /// difference shows on the billing page the day somebody asks whether an
+  /// account has ever been topped up outside its own purchases.
+  ONBOARDING_TOPUP
+  /// The whole balance leaving an account that was transferred to another.
+  /// Negative, and paired with an `ACCOUNT_TRANSFER_IN` of the same size on
+  /// the destination in the same transaction. Each note names the other
+  /// account, which is the only thing connecting the two halves of a history
+  /// that now sits on two accounts.
+  ACCOUNT_TRANSFER_OUT
+  /// The counterpart: the balance arriving at the destination account.
+  ///
+  /// A pair rather than one signed `ADJUSTMENT` on each side for the reason
+  /// `CALL_USAGE_SHORTFALL` is not a zero-amount `CALL_USAGE`: "staff
+  /// corrected this" and "this moved to another account" are different facts,
+  /// and a ledger that cannot filter one from the other cannot answer where a
+  /// customer's credits went.
+  ACCOUNT_TRANSFER_IN
+}
+
+/// Local inventory of a DID owned by the platform's telephony connection.
+///
+/// Provider facts come from sync; tenancy and billing columns are owned by
+/// renting and by staff. The sync upsert must never write `workspaceId`,
+/// `status`, `monthlyPriceCredits`, `rentedPriceCredits`, `rentedAt`,
+/// `nextRenewalAt` or `pastDueSince` — a refresh that un-rented a number would
+/// leave the ledger recording charges for nothing.
+model PhoneNumber {
+  id         String  @id @default(cuid())
+  /// E.164, canonicalized on the way in. Globally unique, unlike a contact's
+  /// phone: a DID is one real-world number, and two rows for it is a double
+  /// rental waiting to happen.
+  did        String  @unique
+  /// The provider's own DID id, as text. What sync matches on.
+  externalId String? @unique
+  provider   String?
+
+  countryCode       String?
+  numberType        String?
+  providerStatus    String?
+  /// When the PROVIDER's rental of this DID to the platform expires. Nothing
+  /// to do with `nextRenewalAt`, which is the platform's rental to a
+  /// workspace; billing a customer on the provider's calendar would be wrong.
+  providerExpiresAt DateTime?
+  /// Last provider payload; a display cache for staff, not a source of truth.
+  rawProvider       Json?
+  lastSyncedAt      DateTime?
+
+  status              PhoneNumberStatus @default(UNASSIGNED)
+  workspaceId         String?
+  /// The CATALOG price: what this DID costs to rent from today. Null means
+  /// "use the global default". It never means free. Staff may edit it freely;
+  /// it does not reach an existing rental, which charges the snapshot below.
+  monthlyPriceCredits BigInt?
+  /// The price this workspace actually agreed to, captured when the DID was
+  /// rented and cleared when it goes back to the pool.
+  ///
+  /// The renewal sweep charges THIS, never the catalog price. Reading the
+  /// catalog price at renewal made a rental's cost a live value: re-pricing a
+  /// DID — or correcting the global default — silently re-billed every
+  /// customer already renting one, at a number they never agreed to, with
+  /// nothing in the ledger recording that the price had moved.
+  rentedPriceCredits  BigInt?
+  rentedAt            DateTime?
+  nextRenewalAt       DateTime?
+  /// When the first renewal charge was declined. The grace window is measured
+  /// from here, so retries do not keep pushing the deadline away.
+  pastDueSince        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Restrict, not SetNull. SetNull would leave a row that is ASSIGNED with no
+  // workspace — two fields that must agree, silently disagreeing, on the
+  // record that says who is paying. There is no workspace-delete route yet;
+  // this makes the slice that adds one confront rented numbers explicitly.
+  workspace   Workspace?            @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  ledgerRows  CreditTransaction[]
+  campaigns   Campaign[]
+  dialRosters CampaignPhoneNumber[]
+  // At most one live inbound-facing campaign claims this DID at a time — the
+  // to-one back side of the claim table, whose primary key IS that invariant.
+  inboundClaim CampaignInboundClaim?
+
+  @@index([workspaceId])
+  @@index([status])
+  @@index([status, nextRenewalAt])
+}
+
+/// Append-only record of every credit movement.
+model CreditTransaction {
+  id            String  @id @default(cuid())
+  accountId     String
+  /// The workspace the charge was made on behalf of, captured at write time.
+  /// A snapshot rather than a join: when a DID goes back to the pool its
+  /// `workspaceId` is null, and deriving the workspace from it would make a
+  /// workspace's billing history evaporate exactly when somebody wants to
+  /// read it.
+  workspaceId   String?
+  phoneNumberId String?
+  /// The call this row charges for. Set on `CALL_USAGE` and
+  /// `CALL_USAGE_SHORTFALL` rows only.
+  callAttemptId String?
+  /// The browser test this row charges for. Set on `TEST_SESSION_USAGE` and
+  /// `TEST_SESSION_SHORTFALL` rows only.
+  testSessionId String?
+
+  /// Signed, in internal credit units (10000x the display value). Negative is
+  /// a charge; the release markers are zero.
+  amount BigInt
+  type   CreditTransactionType
+
+  /// Whatever occasioned the row outside this system — an invoice, a ticket.
+  /// Free-form, but unique per account where it is given: it is what makes a
+  /// retried staff adjustment a duplicate rather than a second correction.
+  reference String?
+  /// Required of a staff adjustment by the route, not by the column, so a
+  /// machine-written charge need not invent a sentence.
+  note      String?
+
+  createdAt DateTime @default(now())
+
+  // All three Restrict, matching `PhoneNumber.workspace` and for the same
+  // reason. A ledger documented as append-only cannot have `Cascade` on the
+  // account: deleting an Account would erase its entire financial history,
+  // which is the one thing an audit trail exists to survive. `SetNull` on the
+  // workspace is the same failure in slower motion — it nulls the very
+  // snapshot whose comment above says it exists so history does not evaporate,
+  // and the billing route filters on exactly that column, so those rows become
+  // unreachable rather than merely anonymous.
+  //
+  // No delete route exists for any of the three, so Restrict costs nothing
+  // today. It makes the slice that adds one confront the ledger explicitly.
+  account     Account      @relation(fields: [accountId], references: [id], onDelete: Restrict)
+  workspace   Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: Restrict)
+  phoneNumber PhoneNumber? @relation(fields: [phoneNumberId], references: [id], onDelete: Restrict)
+  // Restrict, matching its three siblings and for the same reason: an
+  // append-only ledger cannot lose the referent of a charge. `CallAttempt`
+  // cascades from its campaign, so this is what stops a campaign delete from
+  // erasing the financial history of the calls it made.
+  callAttempt CallAttempt? @relation(fields: [callAttemptId], references: [id], onDelete: Restrict)
+  // Restrict, exactly like the attempt above: a ledger row must never
+  // outlive the thing it charged for without being able to name it.
+  testSession TestSession? @relation(fields: [testSessionId], references: [id], onDelete: Restrict)
+
+  /// A staff correction carries the invoice or ticket that occasioned it, and
+  /// the same one must not be applied twice. Partial (`reference` nullable), so
+  /// the machine-written rows — which have no reference — are unconstrained.
+  @@unique([accountId, reference])
+  @@index([accountId, createdAt])
+  @@index([workspaceId, createdAt])
+  @@index([phoneNumberId])
+  @@index([callAttemptId])
+  @@index([type, createdAt])
+}
+
+enum TierStatus {
+  ACTIVE
+  REMOVED
+}
+
+/// Local mirror of a voice tier the platform sells, priced by YE.
+///
+/// Upstream owns exactly two facts about a tier — its slug and its label — and
+/// sends neither a price nor a status. Everything below `name` is YE's, which
+/// is why the sync upsert must never write past it: a refresh that reset a
+/// price would re-rate every account holding the tier, from a button whose
+/// label says "Sync". The same invariant the agent and DID mirrors hold.
+model Tier {
+  id     String     @id @default(cuid())
+  /// The platform's own identifier for the tier: what `voices[].tier` carries
+  /// and what `?tier=` accepts. The only stable key upstream gives us, so it
+  /// is what everything here joins on.
+  slug   String     @unique
+  /// Upstream's display label, refreshed by sync.
+  name   String
+  /// YE's, not upstream's. A tier the platform stops listing is marked
+  /// REMOVED and keeps its assignments — deleting it would take its price,
+  /// every account's override, and the referent of any later ledger row.
+  status TierStatus @default(ACTIVE)
+
+  /// The list price per minute of calling, in internal credit units (10000x).
+  /// Null means unpriced, which is how a tier arrives from sync. Unpriced is
+  /// NOT free: a tier with no resolvable rate cannot be used at all.
+  defaultPriceCreditsPerMin BigInt?
+
+  /// The tier's default billing increment, in seconds. A call's duration is
+  /// rounded UP to the next multiple of this before it is priced, so a
+  /// 47-second call on a 60 bills a full minute.
+  ///
+  /// Null means per-second billing, which is the increment of one — there is
+  /// no "off", and every tier arrives from sync this way. Setting one is a
+  /// deliberate act by staff.
+  ///
+  /// Range 1-600 is enforced by a CHECK CONSTRAINT in the migration —
+  /// `CHECK ("billingIncrementSecs" IS NULL OR ... BETWEEN 1 AND 600)`.
+  /// Prisma's schema language cannot express it, so the constraint cannot live
+  /// here; this comment is where you learn it exists. Every write path refuses
+  /// an out-of-range value rather than clamping it, because a clamp charges a
+  /// customer at an increment nobody chose.
+  billingIncrementSecs Int?
+
+  /// The tier an account with no assignment at all is treated as holding.
+  ///
+  /// "Exactly one" is enforced by a PARTIAL UNIQUE INDEX in the migration —
+  /// `CREATE UNIQUE INDEX ... ON "Tier" ("isDefault") WHERE "isDefault"`.
+  /// Prisma's schema language cannot express the predicate, so the constraint
+  /// cannot live here; this comment is where you learn it exists. Postgres
+  /// treats every `false` row as outside the index, so any number of tiers may
+  /// be non-default and at most one may be default.
+  isDefault Boolean @default(false)
+
+  lastSyncedAt DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  accounts AccountTier[]
+}
+
+/// One account's entitlement to one tier, and optionally its own price for it.
+///
+/// An account may hold several tiers. `priceCreditsPerMin` overrides the tier's
+/// default for THIS account only; null means the list price applies.
+model AccountTier {
+  id        String @id @default(cuid())
+  accountId String
+  tierId    String
+
+  /// This account's own rate per minute, in internal credit units. Null means
+  /// the tier's default applies. Never labelled as a discount to the customer
+  /// — it is simply their rate, and what anyone else pays is not on their page.
+  priceCreditsPerMin BigInt?
+
+  /// This account's own billing increment for this tier, in seconds. Null
+  /// means the tier's default applies.
+  ///
+  /// A deliberate `1` here is per-second billing on a tier that pulses — the
+  /// concession you give the customer who noticed — so the fallback is `??`
+  /// and never `||`. Same CHECK CONSTRAINT as the tier's, same reason.
+  billingIncrementSecs Int?
+
+  createdAt DateTime @default(now())
+
+  // Cascade on the account, matching WorkspaceMember: an entitlement is a live
+  // permission rather than financial history, and has no meaning once the
+  // account is gone. Restrict on the tier, matching the never-delete rule
+  // above: nothing may remove a tier row out from under an override that
+  // prices somebody's calls.
+  account Account @relation(fields: [accountId], references: [id], onDelete: Cascade)
+  tier    Tier    @relation(fields: [tierId], references: [id], onDelete: Restrict)
+
+  @@unique([accountId, tierId])
+  @@index([tierId])
+}
+
+/// How far along one dial of one contact is.
+///
+/// `QUEUED | RINGING | IN_PROGRESS` is the non-terminal set, and it is chosen
+/// to match the voice platform's own `statuses_counted` on
+/// `GET /calls/concurrency` — "PENDING, RINGING, IN_PROGRESS". Two systems
+/// counting "in flight" differently is how a local cap and a remote cap come
+/// to disagree about the same call.
+enum CallAttemptStatus {
+  /// Claimed and launched; upstream has not reported progress yet.
+  QUEUED
+  RINGING
+  IN_PROGRESS
+  /// Terminal: the call was answered and ended.
+  COMPLETED
+  /// Terminal: never answered, or the carrier could not place it.
+  FAILED
+  /// The reaper closed this attempt because the outcome was never learned.
+  /// Deliberately NOT `FAILED`: "we never found out" and "the callee did not
+  /// answer" are different facts, and a report that conflates them misstates
+  /// the campaign's own results.
+  ABANDONED
+}
+
+/// One dial of one contact, from claim to outcome to charge.
+///
+/// A contact is dialed once plus up to `Campaign.retryCount` retries — and
+/// again for each callback it books — and each dial is its own row, so a
+/// campaign's history is the list of what was actually tried rather than the
+/// last thing that happened.
+model CallAttempt {
+  id String @id @default(cuid())
+
+  /// Denormalized from `campaignContact`. Every in-flight count and every
+  /// progress query is per campaign, and joining through the contact to reach
+  /// the campaign would put a join on the hot path of the sweep.
+  ///
+  /// Nullable, and null is a real state: an attempt row is also the billing
+  /// record, so deleting a campaign nulls these pointers rather than erasing
+  /// the phone bill. A live call whose campaign was deleted still resolves —
+  /// the webhook finds the attempt by the platform's own ids, not by these.
+  campaignId        String?
+  campaignContactId String?
+
+  /// Snapshots, captured at dial time, exactly as `CreditTransaction`
+  /// snapshots its workspace. Deriving either later would make a campaign's
+  /// billing history follow whoever owns the workspace now.
+  workspaceId String
+  /// WHO IS BILLED: the workspace owner at the moment the call was placed. An
+  /// ownership change mid-call must not redirect the charge to somebody who
+  /// never placed it — the same reasoning `didRenewal.ts` gives for re-reading
+  /// the owner inside its transaction.
+  accountId   String
+
+  /// 1-based, and `MAX(attemptNo) + 1` per contact.
+  ///
+  /// No longer derivable from `CampaignContact.attempts`: that counts retries
+  /// now, and a callback takes the next attempt number while consuming none.
+  /// The unique below is what makes this the dial mutual-exclusion token — two
+  /// dispatchers computing the same next number cannot both place a call.
+  attemptNo Int
+
+  /// The DID this attempt actually dialled from, so a journey can show which
+  /// number in the rotation reached somebody. A snapshot: the campaign's
+  /// rotation may have changed since.
+  fromNumber String?
+
+  /// The platform's own ids, recorded from the 201 that placed the call.
+  /// These, not the correlation id, are the primary way a webhook finds its
+  /// attempt. Unique so a duplicate delivery cannot attach to two rows.
+  upstreamCallId    String? @unique
+  upstreamSessionId String? @unique
+
+  status CallAttemptStatus @default(QUEUED)
+
+  /// Verbatim upstream free text. NEVER an enum: these values follow whichever
+  /// carrier placed the call and the published set grows without this service
+  /// deploying. The calls surface already refuses to enumerate them.
+  ///
+  /// Reached through `call_attempts_campaign_reached_idx` — partial on the two
+  /// literals `REACHED_DISPOSITIONS` names, and so declared in raw SQL rather
+  /// than here, for the reason `call_attempts_campaign_extraction_idx` is:
+  /// Prisma cannot express the predicate, so declaring it in the schema would
+  /// drop the predicate and index the whole table.
+  disposition    String?
+  upstreamStatus String?
+  answeredBy     String?
+  hangupCause    String?
+
+  /// WHO ended the call, beside the `hangupCause` that says how — upstream's
+  /// `hangup_source`, verbatim, and free text for the same reason every
+  /// column above it is: the published set follows whichever carrier placed
+  /// the call and grows without this service deploying.
+  ///
+  /// The old backend stored this and the rewrite dropped it, keeping the
+  /// cause alone; it survived only as a live read on the call-detail screen,
+  /// which stores nothing. It is back because the campaign export derives
+  /// `Call Disconnected By` and `Disconnect Reason Key` from it, and neither
+  /// question can be answered from the cause: "the customer hung up" and "the
+  /// bot hung up" can end a call with the identical Q.850 code.
+  ///
+  /// Null on every attempt settled before this column existed, and on every
+  /// delivery that does not carry the field. Null is NOT "the system" — that
+  /// is a real attribution the export makes from the disposition, and writing
+  /// it here would turn an absence into a claim.
+  hangupSource   String?
+  /// The platform's one-vocabulary answer to how the call ended, replacing
+  /// `hangupCause` + `hangupSource` above (both deprecated upstream, removed
+  /// next release). Written by the completion, the terminal status event and
+  /// the reaper's reconcile; backfilled off the listing for older rows. Free
+  /// text for the reason every column above it is: the platform says the set
+  /// may grow, and an unlisted value must not fail an ingest. `UNKNOWN` and
+  /// `NOT_CONNECTED` are values; null means "no delivery carried it".
+  endCallReason  String?
+  /// The platform's own `error_code` when IT ended the attempt rather than the
+  /// carrier — reaped pre-connect, never handed to the carrier, dismissed by
+  /// an operator, or its telephony account dry. Non-null means the number was
+  /// never tested: the contact went back on the queue at no cost to its
+  /// ladder, and `dialBudget` does not count this row as a dial. Verbatim,
+  /// never an enum: the platform adds codes without this service deploying.
+  errorCode      String?
+  errorMessage   String?
+
+  startedAt    DateTime  @default(now())
+  answeredAt   DateTime?
+  endedAt      DateTime?
+  /// When the outcome was applied on our side. Null while in flight, which is
+  /// the only honest way to tell a live dial from a settled one; the gap from
+  /// here to the next attempt's `startedAt` is the cooldown actually served.
+  resolvedAt   DateTime?
+  /// Billed on this, never on the carrier's `bill_duration_seconds`. The
+  /// completion webhook carries only this one, so billing on the other would
+  /// make the same call cost a different amount depending on whether we
+  /// learned of it by webhook or by reconciliation.
+  durationSecs Int?
+  /// The seconds actually charged for: `durationSecs` rounded UP to
+  /// `billingIncrementSecs`. Always >= `durationSecs`, and always a whole
+  /// multiple of the increment.
+  ///
+  /// Null on every attempt settled before pulse billing existed. Null is NOT
+  /// zero and NOT "the same as the duration" — the second is a guess that
+  /// happens to be right for those rows and teaches a reader to trust it when
+  /// it is not. Readers say the figure was not recorded.
+  billedSecs   Int?
+
+  tierId               String?
+  tierSlug             String?
+  /// SNAPSHOT of the rate this call was launched under, in internal credit
+  /// units. The renewal sweep charges `rentedPriceCredits` and never the
+  /// catalog price for the same reason: a call launched under one rate must be
+  /// charged at that rate even if staff re-price — or retire — the tier while
+  /// the phone is still ringing.
+  rateCreditsPerMin    BigInt?
+  /// SNAPSHOT of the billing increment this call was launched under, captured
+  /// beside the rate above and for the same reason: a call launched under one
+  /// plan must be billed on that plan even if staff re-pulse the tier while
+  /// the phone is still ringing.
+  ///
+  /// No CHECK here, unlike `Tier` and `AccountTier`. This is a copy of a value
+  /// that was already checked when it was set, and a settled charge must never
+  /// become un-writable because staff later narrowed the accepted range.
+  billingIncrementSecs Int?
+  /// What was charged, or — when `shortfall` — what was owed and not taken.
+  costCredits          BigInt?
+  /// Set even for a zero-duration call, so an attempt cannot be charged twice.
+  chargedAt            DateTime?
+  /// The balance could not cover this call. Fail-closed: nothing was debited,
+  /// a zero-amount marker row records the debt, and the campaign is paused.
+  shortfall            Boolean   @default(false)
+
+  /// The conversation, as the platform recorded it: an array of
+  /// `{ role, content, timestamp }`, bounded on the way in by
+  /// `src/lib/sessionCapture.ts`.
+  ///
+  /// NULL and `[]` are different facts and both are real. Null is no
+  /// conversation recorded — never ran, still processing, or a call that never
+  /// connected, which the platform reports as an error OBJECT in this field
+  /// rather than as an array. `[]` is a call that connected and on which
+  /// nobody spoke.
+  ///
+  /// An error object is deliberately NOT stored here. A carrier diagnostic in
+  /// a column named `transcript` is internals filed as something the customer
+  /// said, and every later reader inherits the mistake — the same hazard
+  /// `normalizeTranscript` exists to stop on the read side.
+  transcript Json?
+
+  /// The pre-call variables this dial actually went out with.
+  ///
+  /// Not derivable after the fact, which is the whole reason it is a column.
+  /// The dialer computes them from `Campaign.variableMap` and
+  /// `Contact.metadata` at dial time and forgets them, so reconstructing a
+  /// PAST call's variables reads TODAY's map — and a map edited mid-campaign
+  /// makes that reconstruction quietly wrong about what the agent was told.
+  variables Json?
+
+  /// Whether the platform holds audio for this call.
+  ///
+  /// The flag and never the URL: a presigned recording URL expires in seven
+  /// days, so a stored one is dead almost immediately, and it is a bearer
+  /// credential for a customer's call audio that outlives any membership
+  /// check. The bytes are fetched through this service against a freshly
+  /// minted URL; this column only says whether asking is worth it.
+  ///
+  /// Null is a third state and not `false`: nobody has looked. The journey's
+  /// `hasRecording` guesses from the duration today and its own comment calls
+  /// the call detail's answer authoritative — this is that answer, stored.
+  recordingAvailable Boolean?
+
+  /// The carrier's OWN billed duration, which is not what this platform bills.
+  ///
+  /// Kept for the carrier-detail readout and for reconciling an invoice
+  /// against a call. Billing reads `durationSecs`, deliberately: the
+  /// completion webhook carries only that one, so billing on this would make
+  /// the same call cost a different amount depending on whether we learned of
+  /// it by webhook or by reconciliation.
+  billDurationSeconds Int?
+
+  /// What this call's post-call extraction returned: the agent's own keys and
+  /// the answers a language model wrote for them, bounded on the way in.
+  ///
+  /// Null and `{}` are different facts and both are real. Null is an
+  /// extraction that never ran — the agent has no keys, or we heard nothing;
+  /// `{}` is one that ran and matched none of its keys, which is a thing the
+  /// call did.
+  ///
+  /// Stored rather than derived because lead buckets are computed at READ
+  /// time: a campaign that changes which key it buckets on re-reads its own
+  /// history instead of only affecting calls placed after the change. That is
+  /// only possible if the answers outlive the delivery that carried them.
+  ///
+  /// Not an index target as a whole. The bucket readout reaches it through
+  /// `call_attempts_campaign_extraction_idx` — partial on this column, and so
+  /// declared in raw SQL rather than here — and pulls one key out.
+  extraction Json?
+
+  /// What kind of dial this was — fresh | retry | callback | follow_up —
+  /// stamped when the attempt row is created, from what the claim knew.
+  ///
+  /// A snapshot on purpose: the columns the claim judged (`callbackAt`,
+  /// `nextEligibleAt`) mutate as the contact moves through the queue, so a
+  /// webhook redelivery reading them live could call the same attempt a
+  /// callback on one delivery and a retry on the next. Null on rows written
+  /// before the column existed (and on jobs enqueued before the deploy);
+  /// readers fall back to the ordinal alone.
+  kind String?
+
+  /// Why a claim never became a call. Recorded rather than logged, because the
+  /// operator reading the campaign's attempts is the person who can fix it.
+  launchError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // SetNull on both, not Cascade. An attempt is what a ledger row charges
+  // against, so it must outlive the campaign exactly as the ledger outlives
+  // everything it points at. A cascade here deleted a workspace's phone bill
+  // whenever somebody tidied up a finished campaign.
+  campaign        Campaign?        @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  campaignContact CampaignContact? @relation(fields: [campaignContactId], references: [id], onDelete: SetNull)
+
+  ledgerRows CreditTransaction[]
+
+  // One dial per attempt number per contact. This is the constraint the
+  // dispatcher's `MAX(attemptNo) + 1` derivation leans on: a lost race fails
+  // the insert instead of placing a second call.
+  @@unique([campaignContactId, attemptNo])
+  // The sweep's hottest query: how many of this campaign's calls are live.
+  @@index([campaignId, status])
+  // The same question for an account's whole allotment, across its workspaces.
+  @@index([accountId, status])
+  @@index([campaignContactId])
+  // The attempts feed, and the reaper's scan for stale non-terminal rows.
+  @@index([campaignId, startedAt])
+  @@index([status, startedAt])
+  // Analytics reads this table by workspace and date on every query it runs —
+  // the totals, the duration aggregate, the credits join, the per-campaign
+  // rollup, the daily series and the export's keyset walk. Postgres does not
+  // index a foreign key column on its own, and without this every one of those
+  // scans the platform-wide table: the export pages with ORDER BY startedAt
+  // DESC LIMIT 500 under a bare workspaceId, so it degrades to a sequential
+  // scan plus a top-N sort per page and the whole walk goes quadratic.
+  @@index([workspaceId, startedAt])
+}
+
+enum TestSessionStatus {
+  /// Live. Holds this workspace's one slot, and is the only status the partial
+  /// unique index below counts.
+  ACTIVE
+  /// The browser said it hung up. Frees the slot immediately; still unsettled,
+  /// because what the session cost is the platform's to report and not the
+  /// browser's to claim.
+  ENDING
+  /// Terminal: the platform reported a duration and the charge landed.
+  COMPLETED
+  /// Terminal: the platform refused, or it never gave us a session id.
+  FAILED
+  /// Terminal: the platform has no record of this session. Settled at zero.
+  /// Deliberately not `FAILED`, on the same reasoning `ABANDONED` carries on
+  /// `CallAttemptStatus`: "we never found out" and "it did not work" are
+  /// different facts.
+  ABANDONED
+}
+
+/// One browser WebRTC session against one agent — the Test button on the agent
+/// page.
+///
+/// A test is a call without a carrier: the platform bills it per minute exactly
+/// as it bills a dial, so it needs a row to charge against and that row is
+/// modelled on `CallAttempt` deliberately — same snapshot discipline, same
+/// charge columns, same names. A reader who knows one should not have to learn
+/// the other. What it deliberately does NOT have is everything about campaigns:
+/// no contact, no attempt number, no DID, no correlation key.
+///
+/// **One live session per workspace, enforced by a partial unique index** that
+/// Prisma cannot express and that therefore lives hand-written in the
+/// migration:
+///
+/// ```sql
+/// CREATE UNIQUE INDEX "test_sessions_one_live_per_workspace"
+///   ON "TestSession" ("workspaceId") WHERE status = 'ACTIVE';
+/// ```
+///
+/// An index rather than a counted check, so the cap is atomic instead of a
+/// check-then-act that two clicks slip between.
+model TestSession {
+  id String @id @default(cuid())
+
+  /// Snapshots, captured at start, exactly as `CallAttempt` captures its
+  /// workspace and account. Plain columns and no foreign key: this row is a
+  /// billing record and has to outlive everything it names.
+  workspaceId        String
+  /// WHO IS BILLED: the workspace owner at the moment the session started. An
+  /// ownership change mid-session must not redirect the charge to somebody who
+  /// never started it.
+  accountId          String
+  /// The local `Agent` row this session talked to.
+  agentId            String
+  /// Who pressed Test. Not who pays — that is `accountId` — but a charge
+  /// nobody can attribute to a person is a charge nobody can explain.
+  startedByAccountId String
+
+  /// The platform's own session id, recorded from the 201. Unique, so a
+  /// duplicate delivery cannot attach to two rows. Null only between the insert
+  /// that holds the slot and the stamp that follows the 201 — and a row still
+  /// null when the reaper reaches it is `ABANDONED`, since a session we cannot
+  /// name is one we can never settle.
+  upstreamSessionId String? @unique
+
+  status         TestSessionStatus @default(ACTIVE)
+  /// Verbatim upstream free text, never an enum, for the reason `CallAttempt`
+  /// gives about every field it copies from the platform.
+  upstreamStatus String?
+
+  /// SNAPSHOTS of the plan this session started under, both halves resolved
+  /// together by `resolveCallRate`. Read back at settlement rather than
+  /// resolved again: staff may re-price or re-pulse the tier while somebody is
+  /// still talking.
+  tierId               String?
+  tierSlug             String?
+  rateCreditsPerMin    BigInt?
+  billingIncrementSecs Int?
+
+  /// Billed on the platform's `duration_seconds` and on nothing else, for the
+  /// reason the dialer gives: the completion event carries only this one, so
+  /// billing on another field would make the same session cost a different
+  /// amount depending on how we heard of it.
+  durationSecs Int?
+  /// `durationSecs` rounded UP to `billingIncrementSecs`. Always >= it, and
+  /// always a whole number of pulses.
+  billedSecs   Int?
+  /// What was charged, or — when `shortfall` — what was owed and not taken.
+  costCredits  BigInt?
+  /// Set even for a zero-duration session, so one cannot be charged twice by a
+  /// late delivery.
+  chargedAt    DateTime?
+  /// The balance could not cover this session. Fail-closed: nothing was
+  /// debited and a zero-amount marker row records the debt.
+  shortfall    Boolean   @default(false)
+
+  startedAt  DateTime  @default(now())
+  /// When the browser let go, or when the platform said the audio stopped.
+  endedAt    DateTime?
+  /// When the outcome was applied on our side. Null while unsettled, which is
+  /// the only honest way to tell a live session from a closed one.
+  resolvedAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ledgerRows CreditTransaction[]
+
+  /// The workspace's own history, newest first.
+  @@index([workspaceId, startedAt])
+  /// The reaper's scan for rows that have been unsettled too long.
+  @@index([status, startedAt])
+  /// The platform-wide live count the second concurrency cap reads.
+  @@index([accountId, status])
+}
+
+/// One webhook delivery, recorded so a retry cannot apply its effect twice.
+///
+/// The row is written INSIDE the transaction that applies the effect. A
+/// duplicate delivery violates the unique index, the whole transaction rolls
+/// back, and the charge lands exactly once. Writing the marker first and
+/// processing afterwards loses the effect entirely if the process dies between
+/// them — which for a charge is a call nobody is billed for; writing it
+/// afterwards double-charges on a retry.
+model WebhookEvent {
+  id String @id @default(cuid())
+
+  /// The platform's own recommended key shape:
+  ///   `session.completed:{session_id}`
+  ///   `call.status.updated:{call_id}:{status}:{occurred_at}`
+  eventKey String @unique
+  /// The top-level `event` field, kept for operators reading this table.
+  event    String
+
+  receivedAt DateTime @default(now())
+
+  /// There is NO retention policy on this table, exactly as there is none on
+  /// `Notification`. It grows without bound and wants a window somebody has
+  /// decided on; this index is here so that pruning is cheap when it is
+  /// written.
+  @@index([receivedAt])
+}
+
+/// One denormalized fact per **non-campaign** call the voice platform has
+/// placed, ingested from its call listing by `src/services/analyticsIngest.ts`.
+///
+/// **Campaign calls are NOT here.** The dialer already writes a `CallAttempt`
+/// per dial, with a richer record than this and in real time, so ingesting them
+/// here too would double every campaign number on every chart. What has no
+/// local row is everything else on the shared partner account: inbound calls,
+/// calls placed by hand, calls on an agent no workspace holds. That gap is what
+/// this table fills, and it is why the workspace overview reads both sources
+/// while a campaign report reads only `CallAttempt`.
+///
+/// A fact table, NOT a mirror. It holds the scalar columns an aggregate reads
+/// and nothing else — no transcript, no recording, no variables, no raw
+/// payload. Those are large, read briefly, and already served live by call
+/// history; a row here is a *fact about* a call, and the call stays upstream.
+///
+/// It exists because an aggregate cannot be computed by the walk call history
+/// uses. That walk is bounded at twenty upstream pages precisely so one
+/// request cannot read an account's whole history — so every total computed
+/// over it would be computed over a truncated set, and a number carries an
+/// authority a truncated list does not.
+model CallRecord {
+  id String @id @default(cuid())
+
+  /// The platform's own call id, and the idempotency key of the whole ingest:
+  /// re-reading an upstream page writes the same rows and produces one row
+  /// each. The same identifier call history puts on the wire, so a CSV row and
+  /// a call-detail URL name the same call.
+  upstreamCallId String @unique
+
+  /// The workspace this call belongs to, decided at ingest time.
+  ///
+  /// NULL is a real and expected state, not a defect: a call another
+  /// integrator placed on the shared partner account, or one on an agent no
+  /// workspace holds. A NULL row is counted by nobody and is invisible to every
+  /// route. It is never guessed at — the upstream pool is partner-wide, so a
+  /// heuristic here puts one customer's traffic on another customer's chart.
+  workspaceId String?
+
+  /// The local `Agent` mirror row whose `externalId` matched. This is the only
+  /// leg that attributes a row here: a call whose correlation key resolves to a
+  /// campaign is skipped at ingest, because the dialer already recorded it as a
+  /// `CallAttempt`. There is deliberately no `campaignId` column — it would be
+  /// null on every row, and an index on it would be an index on nothing.
+  agentId String?
+
+  /// All free text, all nullable, because every one is absent on some real
+  /// upstream row. `status` and `disposition` follow whichever carrier placed
+  /// the call and their published sets grow without this service deploying —
+  /// an enum here turns next month's carrier disposition into a failed ingest.
+  direction   String?
+  status      String?
+  disposition String?
+
+  /// The COUNTERPARTY: `to_number` outbound, `from_number` inbound. Storing
+  /// both would duplicate what the DID inventory already knows and would put
+  /// this platform's own numbers into a customer-facing export.
+  phone String?
+
+  startedAt    DateTime?
+  durationSecs Int?
+
+  /// Null on every row, and there is no plan to fill it.
+  ///
+  /// Metering charges a CALL ATTEMPT: the dialer prices a campaign call from
+  /// the tier it was launched under and writes a `CALL_USAGE` ledger row
+  /// against the attempt. Nothing here is a campaign call, so nothing here is
+  /// charged — an inbound or hand-placed call on the shared account costs the
+  /// platform, not the workspace.
+  ///
+  /// It is emphatically NOT upstream's `credits_used`, which is what this
+  /// platform was billed by its supplier: call history refuses to emit that
+  /// because publishing it publishes the margin, and copying it into a column
+  /// named `creditsCharged` would put it on a customer's chart.
+  ///
+  /// Kept as the seam for the day non-campaign calls are billed. Every credits
+  /// figure the analytics surface reports comes from the LEDGER, never from
+  /// here and never from `CallAttempt.costCredits` — see `analytics.ts`.
+  creditsCharged BigInt?
+
+  ingestedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  // No foreign keys on workspaceId or agentId, and the absence is the
+  // deliberate part. A fact is an observation about something that already
+  // happened and must outlive what it observed: a campaign is deletable, so
+  // `Restrict` would make this table quietly veto a delete the campaigns
+  // surface offers, and `Cascade` would erase the record of calls that were
+  // really placed. A column that may name a row which is gone is better than
+  // either. The same reasoning `CallWebhookEvent.callId` already carries.
+
+  // The access patterns, and nothing speculative: the overview (workspace +
+  // range) and the outcome breakdown. There is no campaign index because there
+  // are no campaign rows. `startedAt` alone serves the ingest's own high-water
+  // queries.
+  @@index([workspaceId, startedAt])
+  @@index([workspaceId, disposition])
+  @@index([startedAt])
+}
+
+/// Where the incremental ingest got to. One row, keyed on a constant — a table
+/// rather than a column on something else because there is nothing else this
+/// belongs to: it is the state of a platform-wide worker, not a fact about any
+/// workspace.
+model AnalyticsCursor {
+  id String @id @default("singleton")
+
+  /// High-water mark: the newest `started_at` ingest has seen. A pass stops
+  /// once a whole page falls at or below this, minus the overlap window.
+  lastStartedAt DateTime?
+  /// The call id that mark came from, for tie-breaking rows sharing an instant.
+  lastCallId    String?
+
+  /// Low-water mark: the oldest `started_at` ingested. Exists so the dashboard
+  /// can state what the numbers cover. A chart over a fact table seeded three
+  /// days ago must not read as a claim about a workspace's whole history, and
+  /// the only way to stop that is to say where the data begins.
+  coverageFrom DateTime?
+
+  lastRunAt        DateTime?
+  lastRunCount     Int       @default(0)
+  /// The last pass spent its page budget with the question still open, so what
+  /// it read is not everything there was.
+  lastRunTruncated Boolean   @default(false)
+
+  updatedAt DateTime @updatedAt
+}
+
+// ---------- the supplier wallet ----------
+
+enum PlatformTopupStatus {
+  CREATED
+  ATTEMPTED
+  FAILED
+  CREDITED
+  EXPIRED
+  MISMATCH
+}
+
+/// A payment link minted against the supplier wallet, one row per link.
+///
+/// The supplier is the source of truth for status; this is the mirror the
+/// staff console reads, so a reload or a second operator does not lose the
+/// URL. No `createdBy`: staff auth is one shared token, and there is no
+/// per-person identity to record.
+model PlatformTopup {
+  id             String              @id @default(uuid())
+  /// The supplier's `payment_order_id`. What the console polls by.
+  paymentOrderId String              @unique
+  shortUrl       String
+  /// Base: what lands in the wallet.
+  amountRupees   Int
+  gstRupees      Int
+  /// What the payer is charged.
+  totalRupees    Int
+  status         PlatformTopupStatus @default(CREATED)
+  expiresAt      DateTime
+  creditedAt     DateTime?
+  createdAt      DateTime            @default(now())
+  updatedAt      DateTime            @updatedAt
+
+  @@index([status, expiresAt])
+}
+
+/// One row per mutating request a super admin made through the membership
+/// bypass, plus one per grant and revoke. Reads are not recorded, and neither
+/// are writes inside a workspace the account is a real member of. The rule is
+/// "non-GET", not "mutated something": read-shaped POSTs (campaign preview,
+/// contact search, agents/sync) land here too.
+model SuperAdminAction {
+  id          String     @id @default(cuid())
+  /// WHO ACTED. Null for a grant or revoke: those come from the staff console
+  /// over one shared `ADMIN_STAFF_TOKEN`, so the request names nobody, and
+  /// naming the account in the URL here would attribute the grant to the
+  /// person who received it.
+  accountId   String?
+  account     Account?   @relation("SuperAdminActor", fields: [accountId], references: [id], onDelete: Restrict)
+  /// WHO IT WAS ABOUT. Only a grant or revoke has one; a bypassed request is
+  /// about a workspace, not an account.
+  subjectAccountId String?
+  subjectAccount   Account? @relation("SuperAdminSubject", fields: [subjectAccountId], references: [id], onDelete: Restrict)
+  workspaceId String?
+  workspace   Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+  /// PATCH | POST | PUT | DELETE for a request; GRANT | REVOKE for the flag.
+  method      String
+  /// `req.originalUrl` without its query string.
+  path        String
+  /// Response status. A refused attempt is still worth seeing. 499 means the
+  /// client hung up before the response finished, so what the handler did is
+  /// known but what it answered is not.
+  status      Int
+  createdAt   DateTime   @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([subjectAccountId, createdAt])
+  @@index([workspaceId, createdAt])
+  @@index([createdAt])
+}

@@ -1,0 +1,12 @@
+-- Callbacks are always on now: the switch that turned them off has been taken
+-- off every screen, so a campaign still holding `false` would go on refusing
+-- callbacks with no control left anywhere to turn them back on.
+--
+-- Whether a callback is actually BOOKED is unchanged and still decided by the
+-- extraction: `callback_requested_at` has to parse, be far enough ahead, and
+-- roll into the campaign's dialing window. This only removes the operator's
+-- ability to forbid that outright.
+--
+-- One row per campaign, no schema change, no index build. Not reversible by
+-- re-running anything — the previous values are not recorded anywhere.
+UPDATE "Campaign" SET "callbackEnabled" = true WHERE "callbackEnabled" = false;

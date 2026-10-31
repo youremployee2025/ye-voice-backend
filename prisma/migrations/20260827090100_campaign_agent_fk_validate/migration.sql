@@ -1,0 +1,11 @@
+-- Validates the constraint added NOT VALID in the previous migration.
+--
+-- Separate file, and therefore a separate transaction, which is the whole
+-- point: VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE, so the scan runs
+-- while reads and writes continue. Folding it into the previous migration would
+-- reinstate exactly the ACCESS EXCLUSIVE hold that split bought us out of.
+--
+-- The constraint has been enforced on every new row since the moment it was
+-- added; this only proves the rows that predate it, which the UPDATE there
+-- already cleaned. It is expected to find nothing.
+ALTER TABLE "Campaign" VALIDATE CONSTRAINT "Campaign_agentId_fkey";

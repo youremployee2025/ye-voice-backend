@@ -1,0 +1,67 @@
+{
+  "name": "ye-voice-backend",
+  "version": "1.0.0",
+  "description": "API backend for the YE Voice AI platform",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "dev:worker": "tsx watch src/worker.ts",
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "start:worker": "node dist/worker.js",
+    "test": "vitest run",
+    "test:prepare": "node scripts/test-prepare.mjs",
+    "test:ci": "node scripts/ci-test.mjs",
+    "conformance": "tsx scripts/conformance/run.ts",
+    "battle": "tsx scripts/battle-test.ts",
+    "reextract": "tsx scripts/reextract/run.ts",
+    "backfill:hangup-source": "tsx scripts/backfill-hangup-source.ts",
+    "backfill:end-call-reason": "tsx scripts/backfill-end-call-reason.ts",
+    "backfill:session": "tsx scripts/backfill-session-facts.ts",
+    "backfill:inbound-call-id": "tsx scripts/backfill-inbound-phone-call-id.ts"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Arvind9599/ye-voice-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/Arvind9599/ye-voice-backend/issues"
+  },
+  "homepage": "https://github.com/Arvind9599/ye-voice-backend#readme",
+  "dependencies": {
+    "@axiomhq/pino": "^2.0.0",
+    "@clerk/express": "^2.1.62",
+    "@prisma/client": "^6.19.3",
+    "bullmq": "^6.3.2",
+    "cors": "^2.8.6",
+    "csv-parse": "^7.0.2",
+    "dotenv": "^17.4.2",
+    "express": "^4.22.2",
+    "ioredis": "^6.0.0",
+    "libphonenumber-js": "^1.13.11",
+    "multer": "^2.2.0",
+    "pino": "^10.3.1",
+    "pino-http": "^11.0.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^4.17.25",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.3.0",
+    "@types/supertest": "^7.2.1",
+    "pino-pretty": "^13.1.3",
+    "prisma": "^6.19.3",
+    "supertest": "^7.2.2",
+    "tsx": "^4.23.12",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  },
+  "private": true
+}
